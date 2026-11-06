@@ -4,7 +4,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.boss.BarColor;
 import org.bukkit.boss.BarStyle;
 import org.bukkit.boss.BossBar;
-import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitTask;
 import xyz.mdvcraft.mdvbalance.MDVBalance;
@@ -39,6 +38,7 @@ public final class TutorialService {
 
     private MDVRTPHook mdvrtpHook;
     private BukkitTask stateTask;
+    private BukkitTask actionBarTask;
 
     public TutorialService(MDVBalance plugin, TutorialStorage storage) {
         this.plugin = plugin;
@@ -57,22 +57,43 @@ public final class TutorialService {
     public void reload() {
         refreshChatConfig();
         luckPermsHook.refresh();
-        if (mdvrtpHook != null && !mdvrtpHook.isBound()) mdvrtpHook.bind();
+        if (mdvrtpHook != null && !mdvrtpHook.isBound())
+            mdvrtpHook.bind();
         restartTask();
         for (Player player : Bukkit.getOnlinePlayers()) {
             String bypassPermission = chatBypassPermission;
-            chatBypass.put(player.getUniqueId(), bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
+            chatBypass.put(player.getUniqueId(),
+                    bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
 
             TutorialProgress progress = active.get(player.getUniqueId());
-            if (progress != null && !progress.completed()) showObjective(player, progress, false);
+            if (progress != null && !progress.completed()) {
+                TutorialProgress normalized = normalizeProgress(player, progress);
+                if (normalized.completed()) {
+                    storage.save(normalized);
+                    active.remove(player.getUniqueId());
+                    removeBossBar(player.getUniqueId());
+                    chatHidden.remove(player.getUniqueId());
+                    lastReminder.remove(player.getUniqueId());
+                } else {
+                    active.put(player.getUniqueId(), normalized);
+                    showObjective(player, normalized, false);
+                }
+            }
         }
     }
 
     private void restartTask() {
-        if (stateTask != null) stateTask.cancel();
-        if (!enabled()) return;
+        if (stateTask != null)
+            stateTask.cancel();
+        if (actionBarTask != null)
+            actionBarTask.cancel();
+        if (!enabled())
+            return;
         long interval = Math.max(10L, plugin.getConfig().getLong("tutorial.state-check-interval-ticks", 20L));
         stateTask = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, interval, interval);
+        // Cada tick para sobreescribir la actionbar de otros plugins.
+        if (plugin.getConfig().getBoolean("tutorial.actionbar.enabled", true))
+            actionBarTask = Bukkit.getScheduler().runTaskTimer(plugin, this::sendActionBars, 1L, 1L);
     }
 
     public void shutdown() {
@@ -80,7 +101,12 @@ public final class TutorialService {
             stateTask.cancel();
             stateTask = null;
         }
-        for (BossBar bar : bossBars.values()) bar.removeAll();
+        if (actionBarTask != null) {
+            actionBarTask.cancel();
+            actionBarTask = null;
+        }
+        for (BossBar bar : bossBars.values())
+            bar.removeAll();
         bossBars.clear();
         active.clear();
         chatHidden.clear();
@@ -90,7 +116,8 @@ public final class TutorialService {
 
     private void refreshChatConfig() {
         chatFilterEnabled = plugin.getConfig().getBoolean("tutorial.chat-filter.enabled", true);
-        chatBypassPermission = plugin.getConfig().getString("tutorial.chat-filter.bypass-permission", "mdvbalance.tutorial.chat-bypass");
+        chatBypassPermission = plugin.getConfig().getString("tutorial.chat-filter.bypass-permission",
+                "mdvbalance.tutorial.chat-bypass");
     }
 
     public boolean enabled() {
@@ -99,13 +126,17 @@ public final class TutorialService {
     }
 
     public void handleJoin(Player player, boolean firstJoin) {
-        if (!enabled() || player == null) return;
+        if (!enabled() || player == null)
+            return;
         String bypassPermission = chatBypassPermission;
-        chatBypass.put(player.getUniqueId(), bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
+        chatBypass.put(player.getUniqueId(),
+                bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
         Optional<TutorialProgress> stored = storage.load(player.getUniqueId());
         if (stored.isPresent()) {
-            TutorialProgress progress = stored.get();
-            if (!progress.completed() && progress.currentStep() != null) {
+            TutorialProgress progress = normalizeProgress(player, stored.get());
+            if (progress.completed()) {
+                storage.save(progress);
+            } else if (progress.currentStep() != null) {
                 active.put(player.getUniqueId(), progress);
                 showObjective(player, progress, false);
             }
@@ -113,14 +144,17 @@ public final class TutorialService {
         }
 
         boolean onlyNew = plugin.getConfig().getBoolean("tutorial.only-new-players", true);
-        if (!onlyNew || firstJoin) startFresh(player, true);
+        if (!onlyNew || firstJoin)
+            startFresh(player, true);
     }
 
     public void handleQuit(Player player) {
-        if (player == null) return;
+        if (player == null)
+            return;
         UUID uuid = player.getUniqueId();
         BossBar bar = bossBars.remove(uuid);
-        if (bar != null) bar.removeAll();
+        if (bar != null)
+            bar.removeAll();
         chatHidden.remove(uuid);
         lastReminder.remove(uuid);
         chatBypass.remove(uuid);
@@ -128,18 +162,30 @@ public final class TutorialService {
     }
 
     public void startFresh(Player player, boolean sendStartMessage) {
-        if (player == null || !enabled()) return;
+        if (player == null || !enabled())
+            return;
         long now = System.currentTimeMillis();
+        TutorialStep firstStep = firstEnabledStep();
+        if (firstStep == null) {
+            TutorialProgress completed = new TutorialProgress(
+                    player.getUniqueId(), player.getName(), TutorialStep.TOTAL + 1, true, now, now, now);
+            storage.save(completed);
+            active.remove(player.getUniqueId());
+            removeBossBar(player.getUniqueId());
+            chatHidden.remove(player.getUniqueId());
+            lastReminder.remove(player.getUniqueId());
+            return;
+        }
         TutorialProgress progress = new TutorialProgress(
-                player.getUniqueId(), player.getName(), 1, false, now, now, now
-        );
+                player.getUniqueId(), player.getName(), firstStep.number(), false, now, now, now);
         storage.save(progress);
         active.put(player.getUniqueId(), progress);
         showObjective(player, progress, sendStartMessage);
     }
 
     public void reset(Player player) {
-        if (player == null) return;
+        if (player == null)
+            return;
         storage.delete(player.getUniqueId());
         removeBossBar(player.getUniqueId());
         active.remove(player.getUniqueId());
@@ -149,15 +195,15 @@ public final class TutorialService {
     }
 
     public void skip(Player player) {
-        if (player == null) return;
+        if (player == null)
+            return;
         long now = System.currentTimeMillis();
         TutorialProgress current = active.get(player.getUniqueId());
         long started = current == null ? now : current.startedAt();
         long objectiveStarted = current == null ? now : current.objectiveStartedAt();
         TutorialProgress completed = new TutorialProgress(
                 player.getUniqueId(), player.getName(), TutorialStep.TOTAL + 1, true,
-                started, objectiveStarted, now
-        );
+                started, objectiveStarted, now);
         storage.save(completed);
         active.remove(player.getUniqueId());
         chatHidden.remove(player.getUniqueId());
@@ -166,10 +212,30 @@ public final class TutorialService {
     }
 
     public Optional<TutorialProgress> getProgress(Player player) {
-        if (player == null) return Optional.empty();
+        if (player == null)
+            return Optional.empty();
         TutorialProgress cached = active.get(player.getUniqueId());
-        if (cached != null) return Optional.of(cached);
-        return storage.load(player.getUniqueId());
+        if (cached != null)
+            return Optional.of(cached);
+        Optional<TutorialProgress> stored = storage.load(player.getUniqueId());
+        if (stored.isEmpty())
+            return stored;
+        TutorialProgress normalized = normalizeProgress(player, stored.get());
+        if (!normalized.equals(stored.get()))
+            storage.save(normalized);
+        return Optional.of(normalized);
+    }
+
+    public int totalEnabledSteps() {
+        return enabledSteps().size();
+    }
+
+    public int displayStep(TutorialProgress progress) {
+        if (progress == null || progress.currentStep() == null)
+            return totalEnabledSteps();
+        List<TutorialStep> steps = enabledSteps();
+        int position = steps.indexOf(progress.currentStep());
+        return position < 0 ? 0 : position + 1;
     }
 
     public boolean isChatHidden(UUID uuid) {
@@ -185,86 +251,113 @@ public final class TutorialService {
     }
 
     public void signal(Player player, String signal) {
-        if (player == null || signal == null) return;
+        if (player == null || signal == null)
+            return;
         TutorialProgress progress = active.get(player.getUniqueId());
-        if (progress == null || progress.currentStep() != TutorialStep.SUPPLIES) return;
+        if (progress == null || progress.currentStep() != TutorialStep.SUPPLIES)
+            return;
         String expected = plugin.getConfig().getString("tutorial.objectives.supplies.signal", "suministros");
-        if (!expected.equalsIgnoreCase(signal.trim())) return;
+        if (!expected.equalsIgnoreCase(signal.trim()))
+            return;
         advance(player, TutorialStep.SUPPLIES);
     }
 
     public boolean acceptsSignal(Player player, String signal) {
-        if (player == null || signal == null) return false;
+        if (player == null || signal == null)
+            return false;
         TutorialProgress progress = active.get(player.getUniqueId());
-        if (progress == null) return false;
+        if (progress == null)
+            return false;
 
         // Si PlayerKits2 dispara la señal inmediatamente después de elegir raza,
         // no dependemos de esperar al próximo tick de validación del tutorial.
         if (progress.currentStep() == TutorialStep.RACE) {
             String group = plugin.getConfig().getString("tutorial.objectives.race.luckperms-group", "aventurero");
-            String fallback = plugin.getConfig().getString("tutorial.objectives.race.permission-fallback", "group.aventurero");
+            String fallback = plugin.getConfig().getString("tutorial.objectives.race.permission-fallback",
+                    "group.aventurero");
             if (luckPermsHook.hasGroup(player, group, fallback)) {
                 advance(player, TutorialStep.RACE);
                 progress = active.get(player.getUniqueId());
             }
         }
 
-        if (progress == null || progress.currentStep() != TutorialStep.SUPPLIES) return false;
+        if (progress == null || progress.currentStep() != TutorialStep.SUPPLIES)
+            return false;
         String expected = plugin.getConfig().getString("tutorial.objectives.supplies.signal", "suministros");
         return expected.equalsIgnoreCase(signal.trim());
     }
 
     public void onRtpSuccess(Player player, String worldName, String source) {
-        if (player == null || worldName == null) return;
+        if (player == null || worldName == null)
+            return;
         TutorialProgress progress = active.get(player.getUniqueId());
-        if (progress == null || progress.currentStep() != TutorialStep.SURVIVAL) return;
+        if (progress == null || progress.currentStep() != TutorialStep.SURVIVAL)
+            return;
         String requiredWorld = plugin.getConfig().getString("tutorial.objectives.survival.world", "world");
-        if (!requiredWorld.equalsIgnoreCase(worldName)) return;
-        if (!allowedRtpSources().contains(source == null ? "" : source.toUpperCase(Locale.ROOT))) return;
+        if (!requiredWorld.equalsIgnoreCase(worldName))
+            return;
+        if (!allowedRtpSources().contains(source == null ? "" : source.toUpperCase(Locale.ROOT)))
+            return;
         advance(player, TutorialStep.SURVIVAL);
     }
 
     private void tick() {
-        if (!enabled()) return;
+        if (!enabled())
+            return;
         long now = System.currentTimeMillis();
         for (Player player : Bukkit.getOnlinePlayers()) {
             String bypassPermission = chatBypassPermission;
-            chatBypass.put(player.getUniqueId(), bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
+            chatBypass.put(player.getUniqueId(),
+                    bypassPermission != null && !bypassPermission.isBlank() && player.hasPermission(bypassPermission));
 
             TutorialProgress progress = active.get(player.getUniqueId());
-            if (progress == null || progress.completed() || progress.currentStep() == null) continue;
+            if (progress == null || progress.completed() || progress.currentStep() == null)
+                continue;
 
             tryAutoComplete(player, progress);
 
             TutorialProgress after = active.get(player.getUniqueId());
-            if (after == null || after.completed() || after.currentStep() == null) continue;
+            if (after == null || after.completed() || after.currentStep() == null)
+                continue;
             maybeSendReminder(player, after, now);
         }
     }
 
     private void tryAutoComplete(Player player, TutorialProgress progress) {
         TutorialStep step = progress.currentStep();
-        if (step == null) return;
+        if (step == null)
+            return;
+
+        // plugin.getServer().getConsoleSender()
+        // .sendMessage("Try auto-completing step: " + step + " for player: " +
+        // player.getName());
+
         switch (step) {
             case RACE -> {
                 String group = plugin.getConfig().getString("tutorial.objectives.race.luckperms-group", "aventurero");
-                String fallback = plugin.getConfig().getString("tutorial.objectives.race.permission-fallback", "group.aventurero");
-                if (luckPermsHook.hasGroup(player, group, fallback)) advance(player, TutorialStep.RACE);
+                String fallback = plugin.getConfig().getString("tutorial.objectives.race.permission-fallback",
+                        "group.aventurero");
+                if (luckPermsHook.hasGroup(player, group, fallback))
+                    advance(player, TutorialStep.RACE);
             }
             case SUPPLIES -> {
                 // Se completa exclusivamente mediante la señal de claim exitoso de PlayerKits2.
             }
             case SURVIVAL -> {
                 String world = plugin.getConfig().getString("tutorial.objectives.survival.world", "world");
-                if (mdvrtpHook != null && mdvrtpHook.matchesLastSuccessfulRtp(
-                        player, world, progress.objectiveStartedAt(), allowedRtpSources())) {
+                boolean rtpMatched = mdvrtpHook != null && mdvrtpHook.matchesLastSuccessfulRtp(
+                        player, world, progress.objectiveStartedAt(), allowedRtpSources());
+
+                if (rtpMatched || world.equalsIgnoreCase(player.getWorld().getName())) {
                     advance(player, TutorialStep.SURVIVAL);
                 }
             }
             case HOME -> {
                 int minimum = Math.max(1, plugin.getConfig().getInt("tutorial.objectives.home.minimum-homes", 1));
-                String path = plugin.getConfig().getString("tutorial.objectives.home.essentials-userdata-path", "plugins/Essentials/userdata");
-                if (essentialsHomesHook.getHomeCount(player, path) >= minimum) advance(player, TutorialStep.HOME);
+                String path = plugin.getConfig().getString("tutorial.objectives.home.essentials-userdata-path",
+                        "plugins/Essentials/userdata");
+                if (essentialsHomesHook.getHomeCount(player, path) >= minimum)
+                    advance(player, TutorialStep.HOME);
             }
         }
     }
@@ -273,28 +366,34 @@ public final class TutorialService {
         List<String> configured = plugin.getConfig().getStringList("tutorial.objectives.survival.allowed-sources");
         Set<String> out = new HashSet<>();
         for (String source : configured) {
-            if (source != null && !source.isBlank()) out.add(source.trim().toUpperCase(Locale.ROOT));
+            if (source != null && !source.isBlank())
+                out.add(source.trim().toUpperCase(Locale.ROOT));
         }
-        if (out.isEmpty()) out.addAll(Set.of("COMMAND", "SIGN", "PORTAL"));
+        if (out.isEmpty())
+            out.addAll(Set.of("COMMAND", "SIGN", "PORTAL"));
         return out;
     }
 
     private void advance(Player player, TutorialStep expected) {
         TutorialProgress current = active.get(player.getUniqueId());
-        if (current == null || current.completed() || current.currentStep() != expected) return;
+        if (current == null || current.completed() || current.currentStep() != expected)
+            return;
 
         long now = System.currentTimeMillis();
-        if (current.step() >= TutorialStep.TOTAL) {
+        TutorialStep next = nextEnabledStep(expected);
+        if (next == null) {
             complete(player, current, now);
             return;
         }
 
         playConfiguredSound(player, "tutorial.sounds.objective-complete");
 
-        TutorialProgress next = current.advance(player.getName(), now);
-        storage.save(next);
-        active.put(player.getUniqueId(), next);
-        showObjective(player, next, true);
+        TutorialProgress nextProgress = new TutorialProgress(
+                current.uuid(), player.getName(), next.number(), false,
+                current.startedAt(), now, now);
+        storage.save(nextProgress);
+        active.put(player.getUniqueId(), nextProgress);
+        showObjective(player, nextProgress, true);
     }
 
     private void complete(Player player, TutorialProgress current, long now) {
@@ -312,7 +411,8 @@ public final class TutorialService {
         if (bar != null) {
             bar.setTitle(ColorUtil.color("&6&l✦ TUTORIAL COMPLETADO ✦"));
             bar.setProgress(1.0D);
-            if (!bar.getPlayers().contains(player)) bar.addPlayer(player);
+            if (!bar.getPlayers().contains(player))
+                bar.addPlayer(player);
             bar.setVisible(true);
             long ticks = Math.max(1L, plugin.getConfig().getLong("tutorial.completion.bossbar-seconds", 3L) * 20L);
             Bukkit.getScheduler().runTaskLater(plugin, () -> removeBossBar(player.getUniqueId()), ticks);
@@ -321,7 +421,8 @@ public final class TutorialService {
 
     private void showObjective(Player player, TutorialProgress progress, boolean sendStartMessage) {
         TutorialStep step = progress.currentStep();
-        if (step == null) return;
+        if (step == null)
+            return;
 
         String base = "tutorial.objectives." + step.configKey();
         boolean hide = plugin.getConfig().getBoolean(base + ".hide-player-chat", false)
@@ -332,11 +433,12 @@ public final class TutorialService {
         if (plugin.getConfig().getBoolean("tutorial.bossbar.enabled", true)) {
             BossBar bar = bossBars.computeIfAbsent(player.getUniqueId(), uuid -> createBossBar());
             if (bar != null) {
-                String title = plugin.getConfig().getString(base + ".title", step.configKey());
-                String format = plugin.getConfig().getString("tutorial.bossbar.format", "&6&l✦ {objective} &7({step}/{total})");
-                bar.setTitle(ColorUtil.color(formatText(format, player, progress, title)));
-                bar.setProgress(Math.max(0D, Math.min(1D, progress.step() / (double) TutorialStep.TOTAL)));
-                if (!bar.getPlayers().contains(player)) bar.addPlayer(player);
+                bar.setTitle(objectiveBarMessage(player, progress));
+                int total = totalEnabledSteps();
+                bar.setProgress(total == 0 ? 1D
+                        : Math.max(0D, Math.min(1D, displayStep(progress) / (double) total)));
+                if (!bar.getPlayers().contains(player))
+                    bar.addPlayer(player);
                 bar.setVisible(true);
             }
         } else {
@@ -348,10 +450,35 @@ public final class TutorialService {
         }
     }
 
+    private void sendActionBars() {
+        if (active.isEmpty())
+            return;
+        for (var entry : active.entrySet()) {
+            TutorialProgress progress = entry.getValue();
+            if (progress.completed() || progress.currentStep() == null)
+                continue;
+            Player player = Bukkit.getPlayer(entry.getKey());
+            if (player == null || !player.isOnline())
+                continue;
+            player.sendActionBar(objectiveBarMessage(player, progress));
+        }
+    }
+
+    private String objectiveBarMessage(Player player, TutorialProgress progress) {
+        TutorialStep step = progress.currentStep();
+        String base = "tutorial.objectives." + step.configKey();
+        String title = plugin.getConfig().getString(base + ".title", step.configKey());
+        String format = plugin.getConfig().getString("tutorial.bossbar.format",
+                "&6&l✦ {objective} &7({step}/{total})");
+        return ColorUtil.color(formatText(format, player, progress, title));
+    }
+
     private BossBar createBossBar() {
         try {
-            BarColor color = BarColor.valueOf(plugin.getConfig().getString("tutorial.bossbar.color", "YELLOW").toUpperCase(Locale.ROOT));
-            BarStyle style = BarStyle.valueOf(plugin.getConfig().getString("tutorial.bossbar.style", "SOLID").toUpperCase(Locale.ROOT));
+            BarColor color = BarColor
+                    .valueOf(plugin.getConfig().getString("tutorial.bossbar.color", "YELLOW").toUpperCase(Locale.ROOT));
+            BarStyle style = BarStyle
+                    .valueOf(plugin.getConfig().getString("tutorial.bossbar.style", "SOLID").toUpperCase(Locale.ROOT));
             return Bukkit.createBossBar("", color, style);
         } catch (IllegalArgumentException ex) {
             return Bukkit.createBossBar("", BarColor.YELLOW, BarStyle.SOLID);
@@ -360,54 +487,118 @@ public final class TutorialService {
 
     private void maybeSendReminder(Player player, TutorialProgress progress, long now) {
         TutorialStep step = progress.currentStep();
-        if (step == null) return;
+        if (step == null)
+            return;
         String base = "tutorial.objectives." + step.configKey() + ".reminder";
-        if (!plugin.getConfig().getBoolean(base + ".enabled", true)) return;
+        if (!plugin.getConfig().getBoolean(base + ".enabled", true))
+            return;
         long intervalMs = Math.max(5L, plugin.getConfig().getLong(base + ".interval-seconds", 30L)) * 1000L;
         long last = lastReminder.getOrDefault(player.getUniqueId(), progress.objectiveStartedAt());
-        if (now - last < intervalMs) return;
+        if (now - last < intervalMs)
+            return;
         lastReminder.put(player.getUniqueId(), now);
         List<String> lines = plugin.getConfig().getStringList(base + ".message");
         sendLines(player, lines, progress);
     }
 
     private void playConfiguredSound(Player player, String base) {
-        if (player == null || base == null || base.isBlank()) return;
-        if (!plugin.getConfig().getBoolean(base + ".enabled", true)) return;
+        if (player == null || base == null || base.isBlank())
+            return;
+        if (!plugin.getConfig().getBoolean(base + ".enabled", true))
+            return;
 
         String configured = plugin.getConfig().getString(base + ".sound", "minecraft:block.note_block.pling");
-        if (configured == null || configured.isBlank()) return;
+        if (configured == null || configured.isBlank())
+            return;
 
         float volume = (float) Math.max(0.0D, plugin.getConfig().getDouble(base + ".volume", 1.0D));
         float pitch = (float) Math.max(0.0D, plugin.getConfig().getDouble(base + ".pitch", 1.0D));
 
         String sound = configured.trim().toLowerCase(Locale.ROOT);
-        if (sound.indexOf(':') < 0) sound = "minecraft:" + sound;
+        if (sound.indexOf(':') < 0)
+            sound = "minecraft:" + sound;
         player.playSound(player.getLocation(), sound, volume, pitch);
     }
 
     private void sendLines(Player player, List<String> lines, TutorialProgress progress) {
-        if (lines == null || lines.isEmpty()) return;
+        if (lines == null || lines.isEmpty())
+            return;
         TutorialStep step = progress == null ? null : progress.currentStep();
-        String objective = step == null ? "Tutorial" : plugin.getConfig().getString(
-                "tutorial.objectives." + step.configKey() + ".title", step.configKey());
+        String objective = step == null ? "Tutorial"
+                : plugin.getConfig().getString(
+                        "tutorial.objectives." + step.configKey() + ".title", step.configKey());
         for (String line : new ArrayList<>(lines)) {
             player.sendMessage(ColorUtil.color(formatText(line, player, progress, objective)));
         }
     }
 
     private String formatText(String text, Player player, TutorialProgress progress, String objective) {
-        if (text == null) return "";
-        int step = progress == null ? TutorialStep.TOTAL : Math.min(progress.step(), TutorialStep.TOTAL);
+        if (text == null)
+            return "";
+        int total = totalEnabledSteps();
+        int step = progress == null ? total : displayStep(progress);
         return text
                 .replace("{player}", player == null ? "" : player.getName())
                 .replace("{objective}", objective == null ? "" : objective)
                 .replace("{step}", String.valueOf(step))
-                .replace("{total}", String.valueOf(TutorialStep.TOTAL));
+                .replace("{total}", String.valueOf(total));
+    }
+
+    private List<TutorialStep> enabledSteps() {
+        List<TutorialStep> steps = new ArrayList<>();
+        for (TutorialStep step : TutorialStep.values()) {
+            if (plugin.getConfig().getBoolean("tutorial.objectives." + step.configKey() + ".enabled", true))
+                steps.add(step);
+        }
+        return steps;
+    }
+
+    private TutorialStep firstEnabledStep() {
+        List<TutorialStep> steps = enabledSteps();
+        return steps.isEmpty() ? null : steps.get(0);
+    }
+
+    private TutorialStep nextEnabledStep(TutorialStep current) {
+        boolean found = false;
+        for (TutorialStep step : TutorialStep.values()) {
+            if (found && plugin.getConfig().getBoolean(
+                    "tutorial.objectives." + step.configKey() + ".enabled", true))
+                return step;
+            if (step == current)
+                found = true;
+        }
+        return null;
+    }
+
+    private TutorialProgress normalizeProgress(Player player, TutorialProgress progress) {
+        if (progress.completed())
+            return progress;
+        TutorialStep current = progress.currentStep();
+        if (current != null && plugin.getConfig().getBoolean(
+                "tutorial.objectives." + current.configKey() + ".enabled", true))
+            return progress;
+
+        TutorialStep next = current == null ? firstEnabledStep() : nextEnabledStepBeforeOrAt(current);
+        if (next == null)
+            return progress.complete(player.getName(), System.currentTimeMillis());
+        long now = System.currentTimeMillis();
+        return new TutorialProgress(progress.uuid(), player.getName(), next.number(), false,
+                progress.startedAt(), now, now);
+    }
+
+    private TutorialStep nextEnabledStepBeforeOrAt(TutorialStep current) {
+        for (TutorialStep step : TutorialStep.values()) {
+            if (step.number() < current.number())
+                continue;
+            if (plugin.getConfig().getBoolean("tutorial.objectives." + step.configKey() + ".enabled", true))
+                return step;
+        }
+        return null;
     }
 
     private void removeBossBar(UUID uuid) {
         BossBar bar = bossBars.remove(uuid);
-        if (bar != null) bar.removeAll();
+        if (bar != null)
+            bar.removeAll();
     }
 }
